@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/**
+ * @title AvyraSmartPurchase
+ * @author AVYRA Blockchain Engineering — BEYOND EVERY JOURNEY
+ * @notice Gestiona acuerdos de compra para la tienda virtual AVYRA con trazabilidad
+ *         junto al ERP y CRM, manteniendo datos personales sensibles (PII) fuera de la cadena.
+ */
+contract AvyraSmartPurchase {
+    // =========================================================================
+    // ENUMERACIONES Y ESTRUCTURAS
+    // =========================================================================
+
+    enum OrderStatus {
+        None,        // 0: No registrado
+        Created,     // 1: Pedido creado
+        Paid,        // 2: Pago confirmado
+        Preparing,   // 3: Preparación en almacén / ERP
+        Shipped,     // 4: Enviado / en tránsito
+        Completed,   // 5: Operación finalizada
+        Cancelled    // 6: Cancelado / Reembolsado
+    }
+
+    enum PaymentStatus {
+        Pending,         // Pendiente de confirmación
+        ConfirmedOnChain,// Pagado directamente en blockchain
+        ConfirmedExternal,// Confirmado externamente (tarjeta / transferencia bancaria)
+        Refunded         // Reembolsado según condiciones
+    }
+
+    enum PaymentChannel {
+        Blockchain,      // Pago nativo / compatible con smart contract
+        ExternalFiat     // Requiere confirmación externa autorizada (banco / tarjeta)
+    }
+
+    struct ShipmentInfo {
+        bytes32 carrierHash;     // Hash del transportista / courier (sin exponer PII)
+        bytes32 trackingHash;    // Hash o identificador de guía de envío
+        bytes32 warehouseCode;   // Código de centro logístico / almacén ERP
+        uint256 shippedAt;       // Timestamp de registro de envío
+        bool recorded;
+    }
+
+    struct PurchaseOrder {
+        string orderId;              // Identificador único de pedido (ej. AVY-2026-8419)
+        bytes32 skuHash;             // Referencia hash de catálogo / SKU AVYRA
+        address buyer;               // Dirección de billetera del comprador
+        uint256 amountWei;           // Monto acordado de la operación en Wei
+        string conditions;           // Condiciones de compra / entrega / reembolso
+        OrderStatus status;          // Estado actual del contrato
+        PaymentStatus paymentStatus; // Estado del pago
+        PaymentChannel channel;      // Canal de pago (Blockchain o Confirmación Externa)
+        uint256 createdAt;           // Fecha/hora de registro
+        uint256 updatedAt;           // Última actualización
+        bool conditionsVerified;     // Cumplimiento de condiciones verificado
+        ShipmentInfo shipment;       // Datos operativos de envío
+    }
+
+    // =========================================================================
+    // ROLES Y CONTROL DE ACCESO
+    // =========================================================================
+
+    address public owner;
+    mapping(address => bool) public admins;
+    mapping(address => bool) public paymentVerifiers; // Autorizados a confirmar pagos externos (fiat)
+    mapping(address => bool) public erpOperators;     // Autorizados a actualizar preparación y envío
+
+    // =========================================================================
+    // ALMACENAMIENTO DE PEDIDOS E HISTORIAL
+    // =========================================================================
+
+    mapping(string => PurchaseOrder) private orders;
+    mapping(address => string[]) private buyerOrderHistory;
+    string[] private allOrderIds;
+
+    // =========================================================================
+    // EVENTOS
+    // =========================================================================
+
+    event OrderCreated(
+        string indexed orderId,
+        address indexed buyer,
+        uint256 amountWei,
+        PaymentChannel channel,
+        string conditions,
+        uint256 timestamp
+    );
+
+    event PaymentRecorded(
+        string indexed orderId,
+        address indexed payer,
+        uint256 amountWei,
+        PaymentStatus paymentStatus,
+        bytes32 externalRefHash,
+        uint256 timestamp
+    );
+
+    event OrderStatusUpdated(
+        string indexed orderId,
+        OrderStatus previousStatus,
+        OrderStatus newStatus,
+        address indexed actor,
+        uint256 timestamp
+    );
+
+    event ShipmentRecorded(
+        string indexed orderId,
+        bytes32 carrierHash,
+        bytes32 trackingHash,
+        bytes32 warehouseCode,
+        uint256 timestamp
+    );
+
+    event ConditionsVerified(
+        string indexed orderId,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    event OrderFinalized(
+        string indexed orderId,
+        address indexed buyer,
+        uint256 amountWei,
+        uint256 timestamp
+    );
+
+    event OrderCancelledAndRefunded(
+        string indexed orderId,
+        address indexed buyer,
+        uint256 refundAmountWei,
+        string reason,
+        uint256 timestamp
+    );
+
+    event RoleUpdated(string roleName, address indexed account, bool enabled);
+
+    // =========================================================================
+    // ERRORES PERSONALIZADOS (GAS-EFFICIENT & EXPLICITOS)
+    // =========================================================================
+
+    error UnauthorizedAccess(string requiredRole);
+    error OrderAlreadyExists(string orderId);
+    error OrderNotFound(string orderId);
+    error InvalidAmount();
+    error InvalidBuyerAddress();
+    error DuplicatePaymentNotAllowed(string orderId);
+    error InvalidPaymentChannelForFunction();
+    error InsufficientPaymentAmount(uint256 sent, uint256 requiredAmount);
+    error InvalidStateTransition(OrderStatus currentStatus, OrderStatus targetStatus);
+    error ConditionsNotVerified(string orderId);
+    error RefundNotAllowedInCurrentState(OrderStatus currentStatus);
+    error RefundTransferFailed();
+
+    // =========================================================================
+    // MODIFICADORES
+    // =========================================================================
+
+    modifier onlyAdmin() {
+        if (msg.sender != owner && !admins[msg.sender]) {
+            revert UnauthorizedAccess("ADMIN_OR_OWNER");
+        }
+        _;
+    }
+
+    modifier onlyPaymentVerifier() {
+        if (!paymentVerifiers[msg.sender] && msg.sender != owner && !admins[msg.sender]) {
+            revert UnauthorizedAccess("PAYMENT_VERIFIER");
+        }
+        _;
+    }
+
+    modifier onlyErpOperator() {
+        if (!erpOperators[msg.sender] && msg.sender != owner && !admins[msg.sender]) {
+            revert UnauthorizedAccess("ERP_OPERATOR");
+        }
+        _;
+    }
+
+    modifier orderExists(string calldata _orderId) {
+        if (orders[_orderId].status == OrderStatus.None) {
+            revert OrderNotFound(_orderId);
+        }
+        _;
+    }
+
+    // =========================================================================
+    // CONSTRUCTOR Y ADMINISTRACIÓN DE ROLES
+    // =========================================================================
+
+    constructor() {
+        owner = msg.sender;
+        admins[msg.sender] = true;
+        paymentVerifiers[msg.sender] = true;
+        erpOperators[msg.sender] = true;
+    }
+
+    function setAdmin(address _account, bool _enabled) external onlyAdmin {
+        if (_account == address(0)) revert InvalidBuyerAddress();
+        admins[_account] = _enabled;
+        emit RoleUpdated("ADMIN", _account, _enabled);
+    }
+
+    function setPaymentVerifier(address _account, bool _enabled) external onlyAdmin {
+        if (_account == address(0)) revert InvalidBuyerAddress();
+        paymentVerifiers[_account] = _enabled;
+        emit RoleUpdated("PAYMENT_VERIFIER", _account, _enabled);
+    }
+
+    function setErpOperator(address _account, bool _enabled) external onlyAdmin {
+        if (_account == address(0)) revert InvalidBuyerAddress();
+        erpOperators[_account] = _enabled;
+        emit RoleUpdated("ERP_OPERATOR", _account, _enabled);
+    }
+
+    // =========================================================================
+    // 1. CREACIÓN DE PEDIDOS Y REGISTRO DE ACUERDO
+    // =========================================================================
+
+    function createOrder(
+        string calldata _orderId,
+        bytes32 _skuHash,
+        address _buyer,
+        uint256 _amountWei,
+        PaymentChannel _channel,
+        string calldata _conditions
+    ) external {
+        if (bytes(_orderId).length == 0) revert OrderNotFound(_orderId);
+        if (orders[_orderId].status != OrderStatus.None) {
+            revert OrderAlreadyExists(_orderId);
+        }
+        if (_buyer == address(0)) revert InvalidBuyerAddress();
+        if (_amountWei == 0) revert InvalidAmount();
+
+        PurchaseOrder storage newOrder = orders[_orderId];
+        newOrder.orderId = _orderId;
+        newOrder.skuHash = _skuHash;
+        newOrder.buyer = _buyer;
+        newOrder.amountWei = _amountWei;
+        newOrder.conditions = _conditions;
+        newOrder.status = OrderStatus.Created;
+        newOrder.paymentStatus = PaymentStatus.Pending;
+        newOrder.channel = _channel;
+        newOrder.createdAt = block.timestamp;
+        newOrder.updatedAt = block.timestamp;
+        newOrder.conditionsVerified = false;
+
+        allOrderIds.push(_orderId);
+        buyerOrderHistory[_buyer].push(_orderId);
+
+        emit OrderCreated(
+            _orderId,
+            _buyer,
+            _amountWei,
+            _channel,
+            _conditions,
+            block.timestamp
+        );
+    }
+
+    // =========================================================================
+    // 2. REGISTRO DE PAGOS COMPATIBLES Y CONFIRMACIÓN EXTERNA AUTORIZADA
+    // =========================================================================
+
+    /**
+     * @notice Registra un pago directo compatible en blockchain (ej. ETH en testnet).
+     * @dev Evita pagos duplicados verificando que el pedido siga pendiente y en estado Created.
+     */
+    function recordBlockchainPayment(string calldata _orderId)
+        external
+        payable
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+
+        if (order.channel != PaymentChannel.Blockchain) {
+            revert InvalidPaymentChannelForFunction();
+        }
+        if (
+            order.paymentStatus == PaymentStatus.ConfirmedOnChain ||
+            order.paymentStatus == PaymentStatus.ConfirmedExternal ||
+            order.status != OrderStatus.Created
+        ) {
+            revert DuplicatePaymentNotAllowed(_orderId);
+        }
+        if (msg.value < order.amountWei) {
+            revert InsufficientPaymentAmount(msg.value, order.amountWei);
+        }
+
+        OrderStatus prev = order.status;
+        order.paymentStatus = PaymentStatus.ConfirmedOnChain;
+        order.status = OrderStatus.Paid;
+        order.updatedAt = block.timestamp;
+
+        emit PaymentRecorded(
+            _orderId,
+            msg.sender,
+            msg.value,
+            PaymentStatus.ConfirmedOnChain,
+            keccak256(abi.encodePacked("ONCHAIN_TX", _orderId, block.number)),
+            block.timestamp
+        );
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Paid, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Registra la confirmación externa autorizada de un pago tradicional
+     *         (transferencia bancaria o tarjeta) validado fuera de cadena.
+     * @dev Solo ejecutable por un rol PAYMENT_VERIFIER / ADMIN autorizado.
+     */
+    function confirmExternalPayment(
+        string calldata _orderId,
+        bytes32 _externalAttestationHash
+    )
+        external
+        onlyPaymentVerifier
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+
+        if (order.channel != PaymentChannel.ExternalFiat) {
+            revert InvalidPaymentChannelForFunction();
+        }
+        if (
+            order.paymentStatus == PaymentStatus.ConfirmedExternal ||
+            order.paymentStatus == PaymentStatus.ConfirmedOnChain ||
+            order.status != OrderStatus.Created
+        ) {
+            revert DuplicatePaymentNotAllowed(_orderId);
+        }
+
+        OrderStatus prev = order.status;
+        order.paymentStatus = PaymentStatus.ConfirmedExternal;
+        order.status = OrderStatus.Paid;
+        order.updatedAt = block.timestamp;
+
+        emit PaymentRecorded(
+            _orderId,
+            msg.sender,
+            order.amountWei,
+            PaymentStatus.ConfirmedExternal,
+            _externalAttestationHash,
+            block.timestamp
+        );
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Paid, msg.sender, block.timestamp);
+    }
+
+    // =========================================================================
+    // 3. ACTUALIZACIÓN DE ESTADOS AUTORIZADOS Y REGISTRO DE ENVÍO (ERP)
+    // =========================================================================
+
+    function markPreparing(string calldata _orderId)
+        external
+        onlyErpOperator
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+        if (order.status != OrderStatus.Paid) {
+            revert InvalidStateTransition(order.status, OrderStatus.Preparing);
+        }
+
+        OrderStatus prev = order.status;
+        order.status = OrderStatus.Preparing;
+        order.updatedAt = block.timestamp;
+
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Preparing, msg.sender, block.timestamp);
+    }
+
+    function recordShipmentConfirmation(
+        string calldata _orderId,
+        bytes32 _carrierHash,
+        bytes32 _trackingHash,
+        bytes32 _warehouseCode
+    )
+        external
+        onlyErpOperator
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+        if (order.status != OrderStatus.Preparing && order.status != OrderStatus.Paid) {
+            revert InvalidStateTransition(order.status, OrderStatus.Shipped);
+        }
+
+        OrderStatus prev = order.status;
+        order.shipment = ShipmentInfo({
+            carrierHash: _carrierHash,
+            trackingHash: _trackingHash,
+            warehouseCode: _warehouseCode,
+            shippedAt: block.timestamp,
+            recorded: true
+        });
+        order.status = OrderStatus.Shipped;
+        order.updatedAt = block.timestamp;
+
+        emit ShipmentRecorded(_orderId, _carrierHash, _trackingHash, _warehouseCode, block.timestamp);
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Shipped, msg.sender, block.timestamp);
+    }
+
+    // =========================================================================
+    // 4. VERIFICACIÓN DE CONDICIONES Y FINALIZACIÓN DE OPERACIÓN
+    // =========================================================================
+
+    function verifyConditions(string calldata _orderId)
+        external
+        onlyErpOperator
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+        if (order.status != OrderStatus.Shipped) {
+            revert InvalidStateTransition(order.status, OrderStatus.Completed);
+        }
+        order.conditionsVerified = true;
+        order.updatedAt = block.timestamp;
+
+        emit ConditionsVerified(_orderId, msg.sender, block.timestamp);
+    }
+
+    function finalizeOrder(string calldata _orderId)
+        external
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+        bool isAuthorizedCaller = (
+            msg.sender == order.buyer ||
+            msg.sender == owner ||
+            admins[msg.sender] ||
+            erpOperators[msg.sender]
+        );
+        if (!isAuthorizedCaller) {
+            revert UnauthorizedAccess("BUYER_ERP_OR_ADMIN");
+        }
+        if (order.status != OrderStatus.Shipped) {
+            revert InvalidStateTransition(order.status, OrderStatus.Completed);
+        }
+        if (!order.conditionsVerified) {
+            revert ConditionsNotVerified(_orderId);
+        }
+
+        OrderStatus prev = order.status;
+        order.status = OrderStatus.Completed;
+        order.updatedAt = block.timestamp;
+
+        emit OrderFinalized(_orderId, order.buyer, order.amountWei, block.timestamp);
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Completed, msg.sender, block.timestamp);
+    }
+
+    // =========================================================================
+    // 5. CANCELACIÓN Y REEMBOLSO BAJO CONDICIONES DEFINIDAS
+    // =========================================================================
+
+    function cancelAndRefund(string calldata _orderId, string calldata _reason)
+        external
+        onlyAdmin
+        orderExists(_orderId)
+    {
+        PurchaseOrder storage order = orders[_orderId];
+
+        // Solo se permite cancelar/reembolsar antes de completar la operación
+        if (
+            order.status == OrderStatus.Completed ||
+            order.status == OrderStatus.Cancelled
+        ) {
+            revert RefundNotAllowedInCurrentState(order.status);
+        }
+
+        OrderStatus prev = order.status;
+        uint256 refundAmount = 0;
+
+        if (
+            order.paymentStatus == PaymentStatus.ConfirmedOnChain ||
+            order.paymentStatus == PaymentStatus.ConfirmedExternal
+        ) {
+            order.paymentStatus = PaymentStatus.Refunded;
+            // Si el pago fue depositado on-chain en este contrato, se transfiere de vuelta al comprador
+            if (order.channel == PaymentChannel.Blockchain && address(this).balance >= order.amountWei) {
+                refundAmount = order.amountWei;
+                (bool ok, ) = payable(order.buyer).call{value: refundAmount}("");
+                if (!ok) revert RefundTransferFailed();
+            }
+        }
+
+        order.status = OrderStatus.Cancelled;
+        order.updatedAt = block.timestamp;
+
+        emit OrderCancelledAndRefunded(_orderId, order.buyer, refundAmount, _reason, block.timestamp);
+        emit OrderStatusUpdated(_orderId, prev, OrderStatus.Cancelled, msg.sender, block.timestamp);
+    }
+
+    // =========================================================================
+    // 6. CONSULTA DE PEDIDOS E HISTORIAL
+    // =========================================================================
+
+    function getOrder(string calldata _orderId)
+        external
+        view
+        orderExists(_orderId)
+        returns (PurchaseOrder memory)
+    {
+        return orders[_orderId];
+    }
+
+    function getBuyerOrders(address _buyer) external view returns (string[] memory) {
+        return buyerOrderHistory[_buyer];
+    }
+
+    function getTotalOrders() external view returns (uint256) {
+        return allOrderIds.length;
+    }
+}
